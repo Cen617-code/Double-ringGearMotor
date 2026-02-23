@@ -1,0 +1,47 @@
+<html>
+<body>
+<pre>
+<h1>礦ision Build Log</h1>
+<h2>Tool Versions:</h2>
+IDE-Version: μVision V5.14.1
+Copyright (C) 2015 ARM Ltd and ARM Germany GmbH. All rights reserved.
+License Information: sure DELL, sure, LIC=47QMA-1VM5B-RK0BI-TKR8K-E5BIZ-37TWA
+ 
+Tool Versions:
+Toolchain:       PK51 Prof. Developers Kit  Version: 9.54
+Toolchain Path:  D:\keilC51\C51\BIN
+C Compiler:      C51.exe V9.54
+Assembler:       A51.exe V8.02c
+Linker/Locator:  BL51.exe V6.22
+Library Manager: LIB51.exe V4.30.1.0
+Hex Converter:   OH51.exe V2.7.0.0
+CPU DLL:         S8051.DLL V3.100.0.0
+Dialog DLL:      DP51.DLL V2.62.0.1 
+<h2>Project:</h2>
+D:\文档\大学\机电系统控制\程序\下位机硬件控制\双硬环分电机\TEST.uvproj
+Project File Date:  05/07/2025
+
+<h2>Output:</h2>
+Rebuild target 'Target 1'
+assembling STARTUP.A51...
+compiling main.c...
+main.c(233): warning C280: 'x_temp': unreferenced local variable
+main.c(233): warning C280: 'y_temp': unreferenced local variable
+main.c(234): warning C280: 'f_temp1': unreferenced local variable
+main.c(234): warning C280: 'f_temp2': unreferenced local variable
+main.c(402): warning C280: 'direction': unreferenced local variable
+linking...
+*** WARNING L15: MULTIPLE CALL TO SEGMENT
+    SEGMENT: ?PR?_UART_SENDSTRING?MAIN
+    CALLER1: ?C_C51STARTUP
+    CALLER2: ?PR?TIMER0_ISR?MAIN
+*** WARNING L15: MULTIPLE CALL TO SEGMENT
+    SEGMENT: ?PR?_UART_SENDSTRING?MAIN
+    CALLER1: ?PR?TIMER0_ISR?MAIN
+    CALLER2: ?PR?UART_ISR?MAIN
+Program Size: data=104.5 xdata=82 code=6548
+creating hex file from ".\Objects\TEST"...
+".\Objects\TEST" - 0 Error(s), 7 Warning(s).
+</pre>
+</body>
+</html>

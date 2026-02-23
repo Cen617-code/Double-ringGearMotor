@@ -1,0 +1,630 @@
+C51 COMPILER V9.54   MAIN                                                                  05/10/2025 23:49:10 PAGE 1   
+
+
+C51 COMPILER V9.54, COMPILATION OF MODULE MAIN
+OBJECT MODULE PLACED IN .\Objects\main.obj
+COMPILER INVOKED BY: D:\keilC51\C51\BIN\C51.EXE main.c OPTIMIZE(9,SPEED) BROWSE DEBUG OBJECTEXTEND PRINT(.\Listings\main
+                    -.lst) TABS(2) OBJECT(.\Objects\main.obj)
+
+line level    source
+
+   1          #include <reg52.h>
+   2          #include <string.h>
+   3          #include <stdio.h>
+   4          #include <math.h>
+   5          
+   6          /* 硬件接口定义 */
+   7          sbit PUL  = P1^0;    // 电机1脉冲信号(X轴)
+   8          sbit DIR  = P1^1;    // 电机1方向信号(X轴)
+   9          sbit ENA  = P1^2;    // 电机1使能信号（低有效）
+  10          sbit PUL2 = P1^7;    // 电机2脉冲信号(Y轴)
+  11          sbit DIR2 = P1^6;    // 电机2方向信号(Y轴)
+  12          
+  13          /* 电机参数配置 */
+  14          #define DEFAULT_STEPS_M1 3200  // 电机1默认步数/圈
+  15          #define DEFAULT_STEPS_M2 3200  // 电机2默认步数/圈
+  16          
+  17          /* 全局变量 - 优化内存分配 */
+  18          typedef struct {
+  19              unsigned int step_count;
+  20              unsigned int target_steps;
+  21              unsigned char direction;
+  22          } MotorControl;
+  23          
+  24          typedef struct {
+  25              int x0, y0;      // 起点坐标
+  26              int x1, y1;      // 终点坐标
+  27              int dx, dy;      // 坐标差值
+  28              int sx, sy;      // 步进方向
+  29              int err;         // 误差项
+  30              int x, y;        // 当前坐标
+  31              unsigned int step_count;  // 当前步数
+  32              unsigned int total_steps; // 总步数
+  33              unsigned char active;     // 插补激活标志
+  34          } LineInterpolator;
+  35          
+  36          /* 圆弧插补结构体 */
+  37          typedef struct {
+  38              int x0, y0;      // 起点坐标
+  39              int x1, y1;      // 终点坐标
+  40              int x, y;        // 当前坐标
+  41              int r;           // 半径
+  42              int f;           // 偏差值
+  43              unsigned int step_count;  // 当前步数
+  44              unsigned int total_steps; // 总步数
+  45              unsigned char active;     // 插补激活标志
+  46              unsigned char quadrant;   // 当前象限
+  47              unsigned char direction;  // 方向(0:逆时针,1:顺时针)
+  48          } ArcInterpolator;
+  49          
+  50          /* 关键性能变量放在idata */
+  51          idata MotorControl motor1 = {0, DEFAULT_STEPS_M1, 1};
+  52          idata MotorControl motor2 = {0, DEFAULT_STEPS_M2, 1};
+  53          bit running = 0;     // 运行状态标志
+  54          
+C51 COMPILER V9.54   MAIN                                                                  05/10/2025 23:49:10 PAGE 2   
+
+  55          /* 大块数据放在xdata */
+  56          xdata LineInterpolator line_interp = {0};
+  57          xdata ArcInterpolator arc_interp = {0};
+  58          
+  59          /* 串口通信配置 */
+  60          #define UART_BUF_SIZE 32  // 适当增大缓冲区，放在xdata
+  61          xdata unsigned char uart_buf[UART_BUF_SIZE];
+  62          unsigned char buf_index = 0;
+  63          
+  64          /******************** 函数声明 ********************/
+  65          void Timer_Init(void);
+  66          void UART_Init(void);
+  67          void UART_SendByte(unsigned char dat);
+  68          void UART_SendString(const char *s);
+  69          void Start_Motion(void);
+  70          void Stop_Motion(void);
+  71          void Process_Command(const char *cmd);
+  72          void LineInterp_Init(int x0, int y0, int x1, int y1);
+  73          bit LineInterp_Step(void);
+  74          void Start_LineInterpolation(int x0, int y0, int x1, int y1);
+  75          void Stop_LineInterpolation(void);
+  76          void ArcInterp_Init(int x0, int y0, int x1, int y1, int r, unsigned char direction);
+  77          bit ArcInterp_Step(void);
+  78          void Start_ArcInterpolation(int x0, int y0, int x1, int y1, int r, unsigned char direction);
+  79          void Stop_ArcInterpolation(void);
+  80          void Determine_Quadrant(void);
+  81          int Calculate_TotalSteps(int x0, int y0, int x1, int y1);
+  82          
+  83          /******************** 初始化函数 ********************/
+  84          void Timer_Init(void)
+  85          {
+  86   1          TMOD = 0x21;    // T0-模式1(16位), T1-模式2(8位自动重装)
+  87   1          TH0 = 0xFF;     // 定时0.5ms@12MHz
+  88   1          TL0 = 0x9C;
+  89   1          ET0 = 1;        // 允许T0中断
+  90   1          TR0 = 0;        // 初始停止
+  91   1          
+  92   1          TH1 = 0xFD;     // 波特率9600@12MHz
+  93   1          TL1 = 0xFD;
+  94   1      }
+  95          
+  96          void UART_Init(void)
+  97          { 
+  98   1          SCON = 0x50;    // 串口模式1,允许接收
+  99   1          TR1 = 1;        // 启动波特率发生器
+ 100   1          ES = 1;         // 允许串口中断
+ 101   1          EA = 1;         // 开总中断
+ 102   1      }
+ 103          
+ 104          /******************** 串口通信函数 ********************/
+ 105          void UART_SendByte(unsigned char dat)
+ 106          {
+ 107   1          SBUF = dat;
+ 108   1          while(!TI);
+ 109   1          TI = 0;
+ 110   1      }
+ 111          
+ 112          void UART_SendString(const char *s)
+ 113          {
+ 114   1          while(*s) {
+ 115   2              UART_SendByte(*s++);
+ 116   2          }
+C51 COMPILER V9.54   MAIN                                                                  05/10/2025 23:49:10 PAGE 3   
+
+ 117   1      }
+ 118          
+ 119          /******************** 直线插补函数 ********************/
+ 120          void LineInterp_Init(int x0, int y0, int x1, int y1)
+ 121          {
+ 122   1          line_interp.x0 = x0;
+ 123   1          line_interp.y0 = y0;
+ 124   1          line_interp.x1 = x1;
+ 125   1          line_interp.y1 = y1;
+ 126   1          line_interp.x = x0;
+ 127   1          line_interp.y = y0;
+ 128   1          
+ 129   1          // 计算坐标差值
+ 130   1          line_interp.dx = abs(x1 - x0);
+ 131   1          line_interp.dy = abs(y1 - y0);
+ 132   1          
+ 133   1          // 计算总步数(取X或Y方向的最大值)
+ 134   1          line_interp.total_steps = (line_interp.dx > line_interp.dy) ? line_interp.dx : line_interp.dy;
+ 135   1          line_interp.step_count = line_interp.total_steps;
+ 136   1          
+ 137   1          // 计算步进方向
+ 138   1          line_interp.sx = (x1 > x0) ? 1 : -1;
+ 139   1          line_interp.sy = (y1 > y0) ? 1 : -1;
+ 140   1          
+ 141   1          // 初始化偏差
+ 142   1          line_interp.err = (line_interp.dx > line_interp.dy) ? (line_interp.dx / 2) : (-line_interp.dy / 2);
+ 143   1          line_interp.active = 1;
+ 144   1      }
+ 145          
+ 146          bit LineInterp_Step(void)
+ 147          {
+ 148   1          // 终点判断
+ 149   1          if (line_interp.step_count == 0) {
+ 150   2              line_interp.active = 0;
+ 151   2              return 0;
+ 152   2          }
+ 153   1          
+ 154   1          // 偏差判别
+ 155   1          if (line_interp.err >= 0) {
+ 156   2              // X方向进给
+ 157   2              line_interp.x += line_interp.sx;
+ 158   2              line_interp.err -= line_interp.dy;
+ 159   2          } else {
+ 160   2              // Y方向进给
+ 161   2              line_interp.y += line_interp.sy;
+ 162   2              line_interp.err += line_interp.dx;
+ 163   2          }
+ 164   1          
+ 165   1          line_interp.step_count--;
+ 166   1          return 1;
+ 167   1      }
+ 168          
+ 169          /******************** 圆弧插补函数 ********************/
+ 170          void Determine_Quadrant(void)
+ 171          {
+ 172   1          /* 确定圆弧所在象限
+ 173   1           * 根据起点和终点坐标判断圆弧所在的象限
+ 174   1           * 参考逐点比较法象限处理原理:cite[7]
+ 175   1           */
+ 176   1          if(arc_interp.x >= 0 && arc_interp.y >= 0) {
+ 177   2              arc_interp.quadrant = 1;  // 第一象限
+ 178   2          } else if(arc_interp.x < 0 && arc_interp.y >= 0) {
+C51 COMPILER V9.54   MAIN                                                                  05/10/2025 23:49:10 PAGE 4   
+
+ 179   2              arc_interp.quadrant = 2;  // 第二象限
+ 180   2          } else if(arc_interp.x < 0 && arc_interp.y < 0) {
+ 181   2              arc_interp.quadrant = 3;  // 第三象限
+ 182   2          } else {
+ 183   2              arc_interp.quadrant = 4;  // 第四象限
+ 184   2          }
+ 185   1      }
+ 186          
+ 187          int Calculate_TotalSteps(int x0, int y0, int x1, int y1)
+ 188          {
+ 189   1          /* 估算圆弧总步数
+ 190   1           * 使用简单的弦长近似计算
+ 191   1           */
+ 192   1          float angle_start = atan2(y0, x0);
+ 193   1          float angle_end = atan2(y1, x1);
+ 194   1          float angle_diff = fabs(angle_end - angle_start);
+ 195   1          if(angle_diff > 3.1415926) {
+ 196   2              angle_diff = 2 * 3.1415926 - angle_diff;
+ 197   2          }
+ 198   1          return (int)(angle_diff * arc_interp.r * 2);  // 2倍超量估算
+ 199   1      }
+ 200          
+ 201          void ArcInterp_Init(int x0, int y0, int x1, int y1, int r, unsigned char direction)
+ 202          {
+ 203   1          /* 圆弧插补初始化
+ 204   1           * 参考逐点比较法圆弧插补原理:cite[3]:cite[4]
+ 205   1           */
+ 206   1          arc_interp.x0 = x0;
+ 207   1          arc_interp.y0 = y0;
+ 208   1          arc_interp.x1 = x1;
+ 209   1          arc_interp.y1 = y1;
+ 210   1          arc_interp.x = x0;
+ 211   1          arc_interp.y = y0;
+ 212   1          arc_interp.r = r;
+ 213   1          arc_interp.direction = direction;
+ 214   1          
+ 215   1          // 计算总步数(估算)
+ 216   1          arc_interp.total_steps = Calculate_TotalSteps(x0, y0, x1, y1);
+ 217   1          arc_interp.step_count = arc_interp.total_steps;
+ 218   1          
+ 219   1          // 初始偏差值
+ 220   1          arc_interp.f = (arc_interp.x * arc_interp.x) + (arc_interp.y * arc_interp.y) - (arc_interp.r * arc_int
+             -erp.r);
+ 221   1          
+ 222   1          // 确定初始象限
+ 223   1          Determine_Quadrant();
+ 224   1          
+ 225   1          arc_interp.active = 1;
+ 226   1      }
+ 227          
+ 228          bit ArcInterp_Step(void)
+ 229          {
+ 230   1          /* 圆弧插补单步执行
+ 231   1           * 参考逐点比较法圆弧插补算法:cite[1]:cite[4]
+ 232   1           */
+ 233   1          int x_temp, y_temp;
+ 234   1          int f_temp1, f_temp2;
+ 235   1          
+ 236   1          // 终点判断
+ 237   1          if(arc_interp.step_count == 0 || 
+ 238   1             (arc_interp.x == arc_interp.x1 && arc_interp.y == arc_interp.y1)) {
+ 239   2              arc_interp.active = 0;
+C51 COMPILER V9.54   MAIN                                                                  05/10/2025 23:49:10 PAGE 5   
+
+ 240   2              return 0;
+ 241   2          }
+ 242   1          
+ 243   1          // 根据象限和方向确定进给方向
+ 244   1          switch(arc_interp.quadrant) {
+ 245   2              case 1:  // 第一象限
+ 246   2                  if(arc_interp.direction == 0) {  // 逆时针
+ 247   3                      // 第一象限逆圆插补规则:cite[5]
+ 248   3                      if(arc_interp.f >= 0) {
+ 249   4                          // -X方向进给
+ 250   4                          arc_interp.x--;
+ 251   4                          arc_interp.f -= 2 * arc_interp.x + 1;
+ 252   4                      } else {
+ 253   4                          // +Y方向进给
+ 254   4                          arc_interp.y++;
+ 255   4                          arc_interp.f += 2 * arc_interp.y + 1;
+ 256   4                      }
+ 257   3                  } else {  // 顺时针
+ 258   3                      // 第一象限顺圆插补规则:cite[3]
+ 259   3                      if(arc_interp.f >= 0) {
+ 260   4                          // -Y方向进给
+ 261   4                          arc_interp.y--;
+ 262   4                          arc_interp.f -= 2 * arc_interp.y + 1;
+ 263   4                      } else {
+ 264   4                          // +X方向进给
+ 265   4                          arc_interp.x++;
+ 266   4                          arc_interp.f += 2 * arc_interp.x + 1;
+ 267   4                      }
+ 268   3                  }
+ 269   2                  break;
+ 270   2                  
+ 271   2              case 2:  // 第二象限
+ 272   2                  if(arc_interp.direction == 0) {  // 逆时针
+ 273   3                      if(arc_interp.f >= 0) {
+ 274   4                          // -Y方向进给
+ 275   4                          arc_interp.y--;
+ 276   4                          arc_interp.f -= 2 * arc_interp.y + 1;
+ 277   4                      } else {
+ 278   4                          // -X方向进给
+ 279   4                          arc_interp.x--;
+ 280   4                          arc_interp.f += 2 * arc_interp.x + 1;
+ 281   4                      }
+ 282   3                  } else {  // 顺时针
+ 283   3                      if(arc_interp.f >= 0) {
+ 284   4                          // +X方向进给
+ 285   4                          arc_interp.x++;
+ 286   4                          arc_interp.f += 2 * arc_interp.x + 1;
+ 287   4                      } else {
+ 288   4                          // -Y方向进给
+ 289   4                          arc_interp.y--;
+ 290   4                          arc_interp.f -= 2 * arc_interp.y + 1;
+ 291   4                      }
+ 292   3                  }
+ 293   2                  break;
+ 294   2                  
+ 295   2              case 3:  // 第三象限
+ 296   2                  if(arc_interp.direction == 0) {  // 逆时针
+ 297   3                      if(arc_interp.f >= 0) {
+ 298   4                          // +X方向进给
+ 299   4                          arc_interp.x++;
+ 300   4                          arc_interp.f += 2 * arc_interp.x + 1;
+ 301   4                      } else {
+C51 COMPILER V9.54   MAIN                                                                  05/10/2025 23:49:10 PAGE 6   
+
+ 302   4                          // -Y方向进给
+ 303   4                          arc_interp.y--;
+ 304   4                          arc_interp.f -= 2 * arc_interp.y + 1;
+ 305   4                      }
+ 306   3                  } else {  // 顺时针
+ 307   3                      if(arc_interp.f >= 0) {
+ 308   4                          // +Y方向进给
+ 309   4                          arc_interp.y++;
+ 310   4                          arc_interp.f += 2 * arc_interp.y + 1;
+ 311   4                      } else {
+ 312   4                          // +X方向进给
+ 313   4                          arc_interp.x++;
+ 314   4                          arc_interp.f += 2 * arc_interp.x + 1;
+ 315   4                      }
+ 316   3                  }
+ 317   2                  break;
+ 318   2                  
+ 319   2              case 4:  // 第四象限
+ 320   2                  if(arc_interp.direction == 0) {  // 逆时针
+ 321   3                      if(arc_interp.f >= 0) {
+ 322   4                          // +Y方向进给
+ 323   4                          arc_interp.y++;
+ 324   4                          arc_interp.f += 2 * arc_interp.y + 1;
+ 325   4                      } else {
+ 326   4                          // +X方向进给
+ 327   4                          arc_interp.x++;
+ 328   4                          arc_interp.f += 2 * arc_interp.x + 1;
+ 329   4                      }
+ 330   3                  } else {  // 顺时针
+ 331   3                      if(arc_interp.f >= 0) {
+ 332   4                          // -X方向进给
+ 333   4                          arc_interp.x--;
+ 334   4                          arc_interp.f -= 2 * arc_interp.x + 1;
+ 335   4                      } else {
+ 336   4                          // +Y方向进给
+ 337   4                          arc_interp.y++;
+ 338   4                          arc_interp.f += 2 * arc_interp.y + 1;
+ 339   4                      }
+ 340   3                  }
+ 341   2                  break;
+ 342   2          }
+ 343   1          
+ 344   1          // 更新象限
+ 345   1          Determine_Quadrant();
+ 346   1          
+ 347   1          arc_interp.step_count--;
+ 348   1          return 1;
+ 349   1      }
+*** WARNING C280 IN LINE 233 OF main.c: 'x_temp': unreferenced local variable
+*** WARNING C280 IN LINE 233 OF main.c: 'y_temp': unreferenced local variable
+*** WARNING C280 IN LINE 234 OF main.c: 'f_temp1': unreferenced local variable
+*** WARNING C280 IN LINE 234 OF main.c: 'f_temp2': unreferenced local variable
+ 350          
+ 351          /******************** 电机控制函数 ********************/
+ 352          void Stop_Motion(void)
+ 353          {
+ 354   1          TR0 = 0;
+ 355   1          ENA = 1;
+ 356   1          running = 0;
+ 357   1          UART_SendString("STOP\r\n");
+ 358   1      }
+ 359          
+C51 COMPILER V9.54   MAIN                                                                  05/10/2025 23:49:10 PAGE 7   
+
+ 360          void Start_LineInterpolation(int x0, int y0, int x1, int y1)
+ 361          {
+ 362   1          LineInterp_Init(x0, y0, x1, y1);
+ 363   1          // 使能电机
+ 364   1          ENA = 0;
+ 365   1          running = 1;
+ 366   1          TR0 = 1;
+ 367   1          UART_SendString("LINE INTERP START\r\n");
+ 368   1      }
+ 369          
+ 370          void Stop_LineInterpolation(void)
+ 371          {
+ 372   1          TR0 = 0;
+ 373   1          ENA = 1;
+ 374   1          running = 0;
+ 375   1          line_interp.active = 0;
+ 376   1          UART_SendString("LINE INTERP STOP\r\n");
+ 377   1      }
+ 378          
+ 379          void Start_ArcInterpolation(int x0, int y0, int x1, int y1, int r, unsigned char direction)
+ 380          {
+ 381   1          ArcInterp_Init(x0, y0, x1, y1, r, direction);
+ 382   1          // 使能电机
+ 383   1          ENA = 0;
+ 384   1          running = 1;
+ 385   1          TR0 = 1;
+ 386   1          UART_SendString("ARC INTERP START\r\n");
+ 387   1      }
+ 388          
+ 389          void Stop_ArcInterpolation(void)
+ 390          {
+ 391   1          TR0 = 0;
+ 392   1          ENA = 1;
+ 393   1          running = 0;
+ 394   1          arc_interp.active = 0;
+ 395   1          UART_SendString("ARC INTERP STOP\r\n");
+ 396   1      }
+ 397          
+ 398          /******************** 命令处理函数 ********************/
+ 399          void Process_Command(const char *cmd)
+ 400          {
+ 401   1          int x0, y0, x1, y1, r;
+ 402   1          unsigned char direction;
+ 403   1      
+ 404   1          if(strcmp(cmd, "STOP") == 0) {
+ 405   2              if(line_interp.active) {
+ 406   3                  Stop_LineInterpolation();
+ 407   3              } else if(arc_interp.active) {
+ 408   3                  Stop_ArcInterpolation();
+ 409   3              } else {
+ 410   3                  Stop_Motion();
+ 411   3              }
+ 412   2          }
+ 413   1          else if(sscanf(cmd, "LINE %d %d %d %d", &x0, &y0, &x1, &y1) == 4) {
+ 414   2              Start_LineInterpolation(x0, y0, x1, y1);
+ 415   2          }
+ 416   1          else if(sscanf(cmd, "ARC_CW %d %d %d %d %d", &x0, &y0, &x1, &y1, &r) == 5) {
+ 417   2              Start_ArcInterpolation(x0, y0, x1, y1, r, 1);  // 顺时针
+ 418   2          }
+ 419   1          else if(sscanf(cmd, "ARC_CCW %d %d %d %d %d", &x0, &y0, &x1, &y1, &r) == 5) {
+ 420   2              Start_ArcInterpolation(x0, y0, x1, y1, r, 0);  // 逆时针
+ 421   2          }
+C51 COMPILER V9.54   MAIN                                                                  05/10/2025 23:49:10 PAGE 8   
+
+ 422   1          else {
+ 423   2              UART_SendString("ERROR: Unknown command\r\n");
+ 424   2          }
+ 425   1      }
+*** WARNING C280 IN LINE 402 OF main.c: 'direction': unreferenced local variable
+ 426          /******************** 中断服务函数 ********************/
+ 427          void Timer0_ISR() interrupt 1
+ 428          {
+ 429   1          static int last_x = 0, last_y = 0;
+ 430   1          int dx, dy;
+ 431   1      
+ 432   1          TH0 = 0xFF;     // 重装定时值
+ 433   1          TL0 = 0x9C;
+ 434   1      
+ 435   1          // 优先处理圆弧插补
+ 436   1          if (arc_interp.active) {
+ 437   2            
+ 438   2              // 记录上次坐标
+ 439   2              last_x = arc_interp.x;
+ 440   2              last_y = arc_interp.y;
+ 441   2              
+ 442   2              // 执行圆弧插补步进
+ 443   2              if (!ArcInterp_Step()) {
+ 444   3                  arc_interp.active = 0;
+ 445   3                  running = 0;
+ 446   3                  TR0 = 0;
+ 447   3                  UART_SendString("ARC INTERP DONE\r\n");
+ 448   3                  return;
+ 449   3              }
+ 450   2              // 计算坐标变化量
+ 451   2                dx = arc_interp.x - last_x;
+ 452   2                dy = arc_interp.y - last_y;
+ 453   2                
+ 454   2                // 电机1步进(X轴)
+ 455   2                if (dx != 0) {
+ 456   3                    DIR = (dx > 0) ? 1 : 0;
+ 457   3                    PUL = ~PUL;
+ 458   3                }
+ 459   2                
+ 460   2                // 电机2步进(Y轴)
+ 461   2                if (dy != 0) {
+ 462   3                    DIR2 = (dy > 0) ? 1 : 0;
+ 463   3                    PUL2 = ~PUL2;
+ 464   3                }
+ 465   2                
+ 466   2                return;
+ 467   2            }
+ 468   1          // 处理直线插补
+ 469   1          if (line_interp.active) {
+ 470   2              // 记录上次坐标
+ 471   2              last_x = line_interp.x;
+ 472   2              last_y = line_interp.y;
+ 473   2              
+ 474   2              // 执行插补步进
+ 475   2              if (!LineInterp_Step()) {
+ 476   3                  line_interp.active = 0;
+ 477   3                  running = 0;
+ 478   3                  TR0 = 0;
+ 479   3                  UART_SendString("LINE INTERP DONE\r\n");
+ 480   3                  return;
+ 481   3              }
+ 482   2              
+C51 COMPILER V9.54   MAIN                                                                  05/10/2025 23:49:10 PAGE 9   
+
+ 483   2              // 计算坐标变化量
+ 484   2              dx = line_interp.x - last_x;
+ 485   2              dy = line_interp.y - last_y;
+ 486   2              
+ 487   2              // 电机1步进(X轴)
+ 488   2              if (dx != 0) {
+ 489   3                  DIR = (dx > 0) ? 1 : 0;
+ 490   3                  PUL = ~PUL;
+ 491   3              }
+ 492   2              
+ 493   2              // 电机2步进(Y轴)
+ 494   2              if (dy != 0) {
+ 495   3                  DIR2 = (dy > 0) ? 1 : 0;
+ 496   3                  PUL2 = ~PUL2;
+ 497   3              }
+ 498   2              
+ 499   2              return;
+ 500   2          }
+ 501   1      
+ 502   1          // 原有单轴运动控制保持不变
+ 503   1          if (motor1.step_count > 0) {
+ 504   2              PUL = ~PUL;
+ 505   2              if (!PUL) {
+ 506   3                  motor1.step_count--;
+ 507   3                  if (motor1.step_count == 0) {
+ 508   4                      ENA = 1;
+ 509   4                      PUL = 0;
+ 510   4                  }
+ 511   3              }
+ 512   2          }
+ 513   1      
+ 514   1          if (motor2.step_count > 0) {
+ 515   2              PUL2 = ~PUL2;
+ 516   2              if (!PUL2) {
+ 517   3                  motor2.step_count--;
+ 518   3                  if (motor2.step_count == 0) {
+ 519   4                      PUL2 = 0;
+ 520   4                  }
+ 521   3              }
+ 522   2          }
+ 523   1      
+ 524   1          if(motor1.step_count == 0 && motor2.step_count == 0 && running) {
+ 525   2              TR0 = 0;
+ 526   2              running = 0;
+ 527   2              UART_SendString("DONE\r\n");
+ 528   2          }
+ 529   1      }
+ 530          
+ 531          
+ 532          
+ 533          void UART_ISR() interrupt 4
+ 534          {  
+ 535   1          unsigned char c;
+ 536   1          if(RI) {
+ 537   2              RI = 0;
+ 538   2              c = SBUF;
+ 539   2              
+ 540   2              if(c == '\r' || c == '\n') {
+ 541   3                  if(buf_index > 0) {
+ 542   4                      uart_buf[buf_index] = '\0';
+ 543   4                      Process_Command(uart_buf);
+ 544   4                      buf_index = 0;
+C51 COMPILER V9.54   MAIN                                                                  05/10/2025 23:49:10 PAGE 10  
+
+ 545   4                  }
+ 546   3              }
+ 547   2              else if(buf_index < UART_BUF_SIZE-1) {
+ 548   3                  uart_buf[buf_index++] = c;
+ 549   3              }
+ 550   2              else {
+ 551   3                  buf_index = 0;  // 缓冲区溢出保护
+ 552   3                  UART_SendString("BUF FULL\r\n");
+ 553   3              }
+ 554   2          }
+ 555   1          
+ 556   1          if(TI) {
+ 557   2              TI = 0;  // 清除发送中断标志
+ 558   2          }
+ 559   1      }
+ 560          
+ 561          /******************** 主函数 ********************/
+ 562          void main()
+ 563          {  
+ 564   1          // 硬件初始化
+ 565   1          Timer_Init();
+ 566   1          UART_Init();
+ 567   1          Stop_Motion();  // 确保电机初始为停止状态
+ 568   1          
+ 569   1          // 系统启动信息
+ 570   1          UART_SendString("READY\r\n");
+ 571   1          UART_SendString("Commands:\r\n");
+ 572   1          UART_SendString("LINE x0 y0 x1 y1 - Line interpolation\r\n");
+ 573   1          UART_SendString("ARC_CW x0 y0 x1 y1 r - Clockwise arc\r\n");
+ 574   1          UART_SendString("ARC_CCW x0 y0 x1 y1 r - Counter-clockwise arc\r\n");
+ 575   1          UART_SendString("STOP - Stop motion\r\n");
+ 576   1          
+ 577   1          // 主循环
+ 578   1          while(1) {
+ 579   2              // 空闲时进入省电模式
+ 580   2              PCON |= 0x01;  // 进入空闲模式
+ 581   2          }
+ 582   1      }
+
+
+MODULE INFORMATION:   STATIC OVERLAYABLE
+   CODE SIZE        =   2297    ----
+   CONSTANT SIZE    =    398    ----
+   XDATA SIZE       =     82    ----
+   PDATA SIZE       =   ----    ----
+   DATA SIZE        =      5      82
+   IDATA SIZE       =     10    ----
+   BIT SIZE         =      1    ----
+END OF MODULE INFORMATION.
+
+
+C51 COMPILATION COMPLETE.  5 WARNING(S),  0 ERROR(S)
